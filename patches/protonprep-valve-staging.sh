@@ -351,5 +351,15 @@
 #    echo "WINE: -FSR- set 'balanced' default mode if no mode is set, and dont set any default mode if a custom mode is set"
 #    patch -Np1 < ../patches/proton/72-fsr-use-balanced-default-mode.patch
 
+    echo "WINE: -Dualsense Haptic Feedback- patch1"
+    patch -Np1 < ../patches/dualsense-haptic-feedback/patch1.patch
+    
+#    # only needed for Proton <8.0
+#    echo "WINE: -Dualsense Haptic Feedback- patch2"
+#    patch -Np1 < ../patches/dualsense-haptic-feedback/patch2.patch
+
+    echo "WINE: -Dualsense Haptic Feedback- patch3"
+    patch -Np1 < ../patches/dualsense-haptic-feedback/patch3.patch
+
 ### END PROTON-GE ADDITIONAL CUSTOM PATCHES ###
 ### END WINE PATCHING ###
