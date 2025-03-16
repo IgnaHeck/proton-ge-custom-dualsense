@@ -35,9 +35,10 @@
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
 #include <windows.h>
+#include <winsvc.h>
 #include <winternl.h>
+#include <shellapi.h>
 #include <shlwapi.h>
-#include <shlobj.h>
 #include <string.h>
 #include <stdio.h>
 #include <limits.h>
@@ -46,15 +47,21 @@
 
 #pragma push_macro("_WIN32")
 #pragma push_macro("__cdecl")
+#pragma push_macro("strncpy")
 #undef _WIN32
 #undef __cdecl
+#undef strncpy
 #include "steam_api.h"
 #pragma pop_macro("_WIN32")
 #pragma pop_macro("__cdecl")
+#pragma pop_macro("strncpy")
 
 #include "wine/debug.h"
 
+#pragma push_macro("wcsncpy")
+#undef wcsncpy
 #include "json/json.h"
+#pragma pop_macro("wcsncpy")
 
 #include "wine/unixlib.h"
 #include "wine/heap.h"
@@ -66,12 +73,60 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(steam);
 
-#define ARRAY_SIZE(a) (sizeof(a) / sizeof(*a))
+/* from shlobj.h, which breaks because of DECLSPEC_IMPORT EXTERN_C in C++ */
+#define CSIDL_LOCAL_APPDATA 0x001c
+#define CSIDL_FLAG_CREATE   0x8000
+
+EXTERN_C WINSHELLAPI HRESULT WINAPI SHGetFolderPathA(HWND hwnd, int nFolder, HANDLE hToken, DWORD dwFlags, LPSTR pszPath);
+EXTERN_C WINSHELLAPI HRESULT WINAPI SHGetFolderPathW(HWND hwnd, int nFolder, HANDLE hToken, DWORD dwFlags, LPWSTR pszPath);
+#define SHGetFolderPath WINELIB_NAME_AW(SHGetFolderPath)
+
+static const WCHAR PROTON_VR_RUNTIME_W[] = {'P','R','O','T','O','N','_','V','R','_','R','U','N','T','I','M','E',0};
+static const WCHAR VR_PATHREG_OVERRIDE_W[] = {'V','R','_','P','A','T','H','R','E','G','_','O','V','E','R','R','I','D','E',0};
+static const WCHAR VR_OVERRIDE_W[] = {'V','R','_','O','V','E','R','R','I','D','E',0};
+static const WCHAR VR_CONFIG_PATH_W[] = {'V','R','_','C','O','N','F','I','G','_','P','A','T','H',0};
+static const WCHAR VR_LOG_PATH_W[] = {'V','R','_','L','O','G','_','P','A','T','H',0};
 
 static bool env_nonzero(const char *env)
 {
     const char *v = getenv(env);
     return v != NULL && *v && v[0] != '0';
+}
+
+static bool convert_path_to_win(std::string &s)
+{
+    WCHAR *path = wine_get_dos_file_name(s.c_str());
+    if(!path)
+        return false;
+
+    DWORD sz = WideCharToMultiByte(CP_UTF8, 0, path, -1, NULL, 0, NULL, NULL);
+    if(!sz)
+    {
+        HeapFree(GetProcessHeap(), 0, path);
+        return false;
+    }
+
+    char *pathUTF8 = (char *)HeapAlloc(GetProcessHeap(), 0, sz);
+    if(!pathUTF8)
+    {
+        HeapFree(GetProcessHeap(), 0, path);
+        return false;
+    }
+
+    sz = WideCharToMultiByte(CP_UTF8, 0, path, -1, pathUTF8, sz, NULL, NULL);
+    if(!sz)
+    {
+        HeapFree(GetProcessHeap(), 0, pathUTF8);
+        HeapFree(GetProcessHeap(), 0, path);
+        return false;
+    }
+
+    s = pathUTF8;
+
+    HeapFree(GetProcessHeap(), 0, pathUTF8);
+    HeapFree(GetProcessHeap(), 0, path);
+
+    return true;
 }
 
 static void set_active_process_pid(void)
@@ -80,7 +135,7 @@ static void set_active_process_pid(void)
     RegSetKeyValueA(HKEY_CURRENT_USER, "Software\\Valve\\Steam\\ActiveProcess", "pid", REG_DWORD, &pid, sizeof(pid));
 }
 
-static DWORD WINAPI create_steam_window(void *arg)
+static DWORD WINAPI create_steam_windows(void *arg)
 {
     static WNDCLASSEXW wndclass = { sizeof(WNDCLASSEXW) };
     static const WCHAR class_nameW[] = {'v','g','u','i','P','o','p','u','p','W','i','n','d','o','w',0};
@@ -93,11 +148,12 @@ static DWORD WINAPI create_steam_window(void *arg)
     RegisterClassExW(&wndclass);
     CreateWindowW(class_nameW, steamW, WS_POPUP, 40, 40,
                   400, 300, NULL, NULL, NULL, NULL);
+    CreateWindowA("static", "SteamVR Status", WS_POPUP, 0, 0, 0, 0, NULL, NULL, NULL, NULL);
 
     while (GetMessageW(&msg, NULL, 0, 0))
     {
         TranslateMessage(&msg);
-        DispatchMessage(&msg);
+        DispatchMessageW(&msg);
     }
 
     return 0;
@@ -111,6 +167,9 @@ static void setup_steam_registry(void)
     char buf[256];
     HKEY key;
     LSTATUS status;
+    const int system_locale_appids[] = {
+        1284210 /* Guild Wars 2 */
+    };
 
     ui_lang = SteamUtils()->GetSteamUILanguage();
     WINE_TRACE("UI language: %s\n", wine_dbgstr_a(ui_lang));
@@ -136,6 +195,18 @@ static void setup_steam_registry(void)
     language = SteamApps()->GetCurrentGameLanguage();
     languages = SteamApps()->GetAvailableGameLanguages();
     WINE_TRACE( "Game language %s, available %s\n", wine_dbgstr_a(language), wine_dbgstr_a(languages) );
+
+    if (strchr(languages, ',') == NULL) /* If there is a list of languages then respect that */
+    {
+        for (int i = 0; i < (sizeof(system_locale_appids) / sizeof(*system_locale_appids)); i++)
+        {
+            if (system_locale_appids[i] == appid)
+            {
+                WINE_TRACE("Not changing system locale for application %i\n",appid);
+                language = NULL;
+            }
+        }
+    }
 
     if (!language) locale = NULL;
     else if (!strcmp( language, "arabic" )) locale = "ar_001.UTF-8";
@@ -169,6 +240,10 @@ static void setup_steam_registry(void)
     else if (!strcmp( language, "vietnamese" )) locale = "vi_VN.UTF-8";
     else WINE_FIXME( "Unsupported game language %s\n", wine_dbgstr_a(language) );
 
+    /* HACK: Bug 23597 Granado Espada Japan (1219160) launcher needs Japanese locale to display correctly */
+    if (appid == 1219160)
+        locale = "ja_JP.UTF-8";
+
     if (locale)
     {
         WINE_FIXME( "Game language %s, defaulting LC_CTYPE / LC_MESSAGES to %s.\n", wine_dbgstr_a(language), locale );
@@ -186,6 +261,21 @@ static void copy_to_win(const char *unix_path, const WCHAR *win_path)
     CopyFileW(src_path, win_path, FALSE);
 
     HeapFree(GetProcessHeap(), 0, src_path);
+}
+
+static void set_env_from_unix(const WCHAR *name, const std::string &val)
+{
+    WCHAR valW[MAX_PATH];
+    DWORD sz;
+
+    sz = MultiByteToWideChar(CP_UTF8, 0, val.c_str(), -1, valW, MAX_PATH);
+    if(!sz)
+    {
+        WINE_WARN("Invalid utf8 seq in vr runtime key\n");
+        return;
+    }
+
+    SetEnvironmentVariableW(name, valW);
 }
 
 /* requires steam API to be initialized */
@@ -223,6 +313,53 @@ static void setup_eac_bridge(void)
     setenv("PROTON_EAC_RUNTIME", path, 1);
 }
 
+static void setup_proton_voice_files(void)
+{
+    const unsigned int proton_voice_files_appid = 3086180;
+    char path[2048];
+    char *path_end;
+
+    if (!SteamApps()->BIsAppInstalled(proton_voice_files_appid))
+        return;
+
+    if (!SteamApps()->GetAppInstallDir(proton_voice_files_appid, path, sizeof(path)))
+        return;
+
+    WINE_TRACE("Found proton voice files at %s\n", path);
+
+    setenv("PROTON_VOICE_FILES", path, 1);
+}
+
+static void setup_proton_soundfonts(void)
+{
+    static const WCHAR PROTON_SOUNDFILES_FILES_W[] = {'P','R','O','T','O','N','_','S','O','U','N','D','F','O','N','T','_','F','I','L','E','S',0};
+    const unsigned int eac_runtime_appid = 3368180;
+    char unix_path[2048];
+    std::string dos_path;
+    char *path_end;
+    LSTATUS status;
+    HKEY gm_key;
+
+    if (!SteamApps()->BIsAppInstalled(eac_runtime_appid))
+        return;
+
+    if (!SteamApps()->GetAppInstallDir(eac_runtime_appid, unix_path, sizeof(unix_path)))
+        return;
+
+    WINE_TRACE("Found Proton Soundfont at %s\n", unix_path);
+
+    dos_path = std::string{unix_path};
+    if (!convert_path_to_win(dos_path))
+    {
+        WINE_ERR("Couldn't convert soundfonts path to win.\n");
+        return;
+    }
+    dos_path += "\\FluidR3_GM.sf2";
+    WINE_TRACE("GM file path %s\n", wine_dbgstr_a(dos_path.c_str()));
+
+    set_env_from_unix(PROTON_SOUNDFILES_FILES_W, dos_path);
+}
+
 static std::string get_linux_vr_path(void)
 {
     const char *e;
@@ -246,16 +383,19 @@ static std::string get_linux_vr_path(void)
 
 static bool get_windows_vr_path(WCHAR *out_path, bool create)
 {
+    static const WCHAR openvrpathsW[] = {'\\','o','p','e','n','v','r','p','a','t','h','s','.','v','r','p','a','t','h',0};
+    static const WCHAR openvrW[] = {'\\','o','p','e','n','v','r',0};
+
     if(FAILED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA | CSIDL_FLAG_CREATE,
                     NULL, 0, out_path)))
         return false;
 
-    lstrcatW(out_path, L"\\openvr");
+    lstrcatW(out_path, openvrW);
 
     if(create)
         CreateDirectoryW(out_path, NULL);
 
-    lstrcatW(out_path, L"\\openvrpaths.vrpath");
+    lstrcatW(out_path, openvrpathsW);
 
     return true;
 }
@@ -350,42 +490,6 @@ static bool write_string_to_file(const WCHAR *filename, const std::string &conte
     return true;
 }
 
-static bool convert_path_to_win(std::string &s)
-{
-    WCHAR *path = wine_get_dos_file_name(s.c_str());
-    if(!path)
-        return false;
-
-    DWORD sz = WideCharToMultiByte(CP_UTF8, 0, path, -1, NULL, 0, NULL, NULL);
-    if(!sz)
-    {
-        HeapFree(GetProcessHeap(), 0, path);
-        return false;
-    }
-
-    char *pathUTF8 = (char *)HeapAlloc(GetProcessHeap(), 0, sz);
-    if(!pathUTF8)
-    {
-        HeapFree(GetProcessHeap(), 0, path);
-        return false;
-    }
-
-    sz = WideCharToMultiByte(CP_UTF8, 0, path, -1, pathUTF8, sz, NULL, NULL);
-    if(!sz)
-    {
-        HeapFree(GetProcessHeap(), 0, pathUTF8);
-        HeapFree(GetProcessHeap(), 0, path);
-        return false;
-    }
-
-    s = pathUTF8;
-
-    HeapFree(GetProcessHeap(), 0, pathUTF8);
-    HeapFree(GetProcessHeap(), 0, path);
-
-    return true;
-}
-
 static void convert_json_array_paths(Json::Value &arr)
 {
     for(uint32_t i = 0; i < arr.size(); ++i)
@@ -411,21 +515,6 @@ static void convert_environment_path(const char *nameA, const WCHAR *nameW)
     SetEnvironmentVariableW(nameW, path);
 
     HeapFree(GetProcessHeap(), 0, path);
-}
-
-static void set_env_from_unix(const WCHAR *name, const std::string &val)
-{
-    WCHAR valW[MAX_PATH];
-    DWORD sz;
-
-    sz = MultiByteToWideChar(CP_UTF8, 0, val.c_str(), -1, valW, MAX_PATH);
-    if(!sz)
-    {
-        WINE_WARN("Invalid utf8 seq in vr runtime key\n");
-        return;
-    }
-
-    SetEnvironmentVariableW(name, valW);
 }
 
 static bool convert_linux_vrpaths(void)
@@ -463,11 +552,11 @@ static bool convert_linux_vrpaths(void)
     const char *vr_override = getenv("VR_OVERRIDE");
     if(vr_override)
     {
-        set_env_from_unix(L"PROTON_VR_RUNTIME", vr_override);
+        set_env_from_unix(PROTON_VR_RUNTIME_W, vr_override);
     }
     else if(root.isMember("runtime") && root["runtime"].isArray() && root["runtime"].size() > 0)
     {
-        set_env_from_unix(L"PROTON_VR_RUNTIME", root["runtime"][0].asString());
+        set_env_from_unix(PROTON_VR_RUNTIME_W, root["runtime"][0].asString());
     }
 
     /* set hard-coded paths */
@@ -486,10 +575,10 @@ static bool convert_linux_vrpaths(void)
     root["external_drivers"] = Json::Value(Json::ValueType::nullValue);
 
     /* write out windows vrpaths */
-    SetEnvironmentVariableW(L"VR_PATHREG_OVERRIDE", NULL);
-    SetEnvironmentVariableW(L"VR_OVERRIDE", NULL);
-    convert_environment_path("VR_CONFIG_PATH", L"VR_CONFIG_PATH");
-    convert_environment_path("VR_LOG_PATH", L"VR_LOG_PATH");
+    SetEnvironmentVariableW(VR_PATHREG_OVERRIDE_W, NULL);
+    SetEnvironmentVariableW(VR_OVERRIDE_W, NULL);
+    convert_environment_path("VR_CONFIG_PATH", VR_CONFIG_PATH_W);
+    convert_environment_path("VR_LOG_PATH", VR_LOG_PATH_W);
     Json::StyledWriter writer;
 
     WCHAR windows_vrpaths[MAX_PATH];
@@ -550,7 +639,7 @@ void* load_vrclient(void)
 #endif
 
     /* PROTON_VR_RUNTIME is provided by the proton setup script */
-    if(!GetEnvironmentVariableW(L"PROTON_VR_RUNTIME", pathW, ARRAY_SIZE(pathW)))
+    if(!GetEnvironmentVariableW(PROTON_VR_RUNTIME_W, pathW, ARRAY_SIZE(pathW)))
     {
         WINE_TRACE("Linux OpenVR runtime is not available\n");
         return 0;
@@ -633,7 +722,7 @@ static void parse_extensions(const char *in, uint32_t *out_count,
 
 extern "C"
 {
-    VkPhysicalDevice WINAPI __wine_get_native_VkPhysicalDevice(VkPhysicalDevice phys_dev);
+    VkPhysicalDevice __wine_get_native_VkPhysicalDevice(VkPhysicalDevice phys_dev);
 };
 
 static void *get_winevulkan_unix_lib_handle(HMODULE hvulkan)
@@ -660,7 +749,7 @@ static void *get_winevulkan_unix_lib_handle(HMODULE hvulkan)
 
 static DWORD WINAPI initialize_vr_data(void *arg)
 {
-    int (WINAPI *p__wineopenxr_get_extensions_internal)(char **instance_extensions, char **device_extensions);
+    int (WINAPI *p__wineopenxr_get_extensions_internal)(char **instance_extensions, char **device_extensions, uint32_t *physdev_vid, uint32_t *physdev_pid);
     vr::IVRClientCore* (*vrclient_VRClientCoreFactory)(const char *name, int *return_code);
     uint32_t instance_extensions_count, device_count;
     VkPhysicalDevice *phys_devices = NULL;
@@ -703,7 +792,7 @@ static DWORD WINAPI initialize_vr_data(void *arg)
     if (!(vrclient_VRClientCoreFactory = reinterpret_cast<decltype(vrclient_VRClientCoreFactory)>
             (dlsym(lib_vrclient, "VRClientCoreFactory"))))
     {
-        WINE_ERR("Could not find function %s.\n", vrclient_VRClientCoreFactory);
+        WINE_ERR("Could not find function VRClientCoreFactory.\n");
         goto done;
     }
     if (!(client_core = vrclient_VRClientCoreFactory(vr::IVRClientCore_Version, &return_code)))
@@ -780,7 +869,7 @@ static DWORD WINAPI initialize_vr_data(void *arg)
             (dlsym(unix_handle, "__wine_get_native_VkPhysicalDevice"));
 
     dlclose(unix_handle);
-    if (!__wine_get_native_VkPhysicalDevice)
+    if (!p__wine_get_native_VkPhysicalDevice)
     {
         WINE_ERR("__wine_get_native_VkPhysicalDevice not found.\n");
         goto done;
@@ -852,13 +941,19 @@ static DWORD WINAPI initialize_vr_data(void *arg)
         }
     }
 
+    if (vr_initialized) {
+        client_core->Cleanup();
+        vr_initialized = FALSE;
+    }
+
     if ((hwineopenxr = LoadLibraryA("wineopenxr.dll")))
     {
         p__wineopenxr_get_extensions_internal = reinterpret_cast<decltype(p__wineopenxr_get_extensions_internal)>
                 (GetProcAddress(hwineopenxr, "__wineopenxr_get_extensions_internal"));
         if (p__wineopenxr_get_extensions_internal)
         {
-            if (!p__wineopenxr_get_extensions_internal(&xr_inst_ext, &xr_dev_ext))
+            uint32_t vid, pid;
+            if (!p__wineopenxr_get_extensions_internal(&xr_inst_ext, &xr_dev_ext, &vid, &pid))
             {
                 WINE_TRACE("Got XR extensions.\n");
                 if ((status = RegSetValueExA(vr_key, "openxr_vulkan_instance_extensions", 0, REG_SZ,
@@ -871,6 +966,18 @@ static DWORD WINAPI initialize_vr_data(void *arg)
                         (BYTE *)xr_dev_ext, strlen(xr_dev_ext) + 1)))
                 {
                     WINE_ERR("Could not set openxr_vulkan_device_extensions value, status %#x.\n", status);
+                    goto done;
+                }
+                if ((status = RegSetValueExA(vr_key, "openxr_vulkan_device_vid", 0, REG_DWORD,
+                        (BYTE *)&vid, sizeof(vid))))
+                {
+                    WINE_ERR("Could not set openxr_vulkan_device_vid value, status %#x.\n", status);
+                    goto done;
+                }
+                if ((status = RegSetValueExA(vr_key, "openxr_vulkan_device_pid", 0, REG_DWORD,
+                        (BYTE *)&pid, sizeof(pid))))
+                {
+                    WINE_ERR("Could not set openxr_vulkan_device_pid value, status %#x.\n", status);
                     goto done;
                 }
             }
@@ -933,9 +1040,9 @@ static void setup_vr_registry(void)
         return;
     }
 
-    if(GetEnvironmentVariableW(L"PROTON_VR_RUNTIME", pathW, ARRAY_SIZE(pathW)))
+    if(GetEnvironmentVariableW(PROTON_VR_RUNTIME_W, pathW, ARRAY_SIZE(pathW)))
     {
-        if ((status = RegSetValueExW(vr_key, L"PROTON_VR_RUNTIME", 0, REG_SZ,
+        if ((status = RegSetValueExW(vr_key, PROTON_VR_RUNTIME_W, 0, REG_SZ,
                 (BYTE *)pathW, (lstrlenW(pathW) + 1) * sizeof(WCHAR))))
         {
             WINE_ERR("Could not set PROTON_VR_RUNTIME value, status %#x.\n", status);
@@ -1028,21 +1135,32 @@ static BOOL streq_niw(const WCHAR *l, const WCHAR *r, size_t len)
     return TRUE;
 }
 
-static BOOL should_use_shell_execute(const WCHAR *cmdline)
+static WCHAR* get_end_of_excutable_name(WCHAR *cmdline)
 {
-    BOOL use_shell_execute = TRUE;
     BOOL quoted = FALSE;
-    const WCHAR *executable_name_end = cmdline;
+    WCHAR *executable_name_end = cmdline;
 
     /* find the end of the first arg...*/
     while (*executable_name_end != '\0' &&
-           (*executable_name_end != ' ' || quoted) &&
-           (*executable_name_end != '"' || !quoted))
+           (*executable_name_end != ' ' || quoted))
     {
         quoted ^= *executable_name_end == '"';
 
         executable_name_end++;
     }
+
+    return executable_name_end;
+}
+
+static BOOL should_use_shell_execute(WCHAR *cmdline)
+{
+    BOOL use_shell_execute = TRUE;
+    const WCHAR *executable_name_end = (const WCHAR*)get_end_of_excutable_name(cmdline);
+
+    /* if the executable is quoted backtrack a bit */
+    if (*(executable_name_end - 1) == '"')
+        --executable_name_end;
+
 
     /* backtrack to before the end of the arg
      * and check if we end in .exe or not
@@ -1063,6 +1181,22 @@ static BOOL should_use_shell_execute(const WCHAR *cmdline)
 
 static HANDLE run_process(BOOL *should_await, BOOL game_process)
 {
+    static const WCHAR link2eaW[] = {'l','i','n','k','2','e','a',':','/','/',0};
+    static const WCHAR link2ea_pathW[] =
+    {
+        'S','o','f','t','w','a','r','e','\\','C','l','a','s','s','e','s','\\','l','i','n','k','2','e','a',0
+    };
+    static const WCHAR ea_desktop_pathW[] =
+    {
+        'S','o','f','t','w','a','r','e','\\','E','l','e','c','t','r','o','n','i','c',' ','A','r','t','s',
+        '\\','E','A',' ','D','e','s','k','t','o','p',0
+    };
+    static const WCHAR ea_core_pathW[] =
+    {
+        'S','o','f','t','w','a','r','e','\\','E','l','e','c','t','r','o','n','i','c',' ','A','r','t','s',
+        '\\','E','A',' ','C','o','r','e',0
+    };
+    static const WCHAR IsUnavailableW[] = {'I','s','U','n','a','v','a','i','l','a','b','l','e',0};
     WCHAR *cmdline = GetCommandLineW();
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi;
@@ -1174,14 +1308,52 @@ run:
     SetConsoleCtrlHandler( console_ctrl_handler, TRUE );
 
     use_shell_execute = should_use_shell_execute(cmdline);
-    if (use_shell_execute && lstrlenW(cmdline) > 10 && !memcmp(cmdline, L"link2ea://", 10 *sizeof(WCHAR)))
+    if (use_shell_execute && lstrlenW(cmdline) > 10 && !memcmp(cmdline, link2eaW, 10 *sizeof(WCHAR)))
     {
         HDESK desktop = GetThreadDesktop(GetCurrentThreadId());
-        DWORD timeout = 300;
+        DWORD is_unavailable, type, size;
+        SC_HANDLE manager, service;
+        SERVICE_STATUS status;
+        DWORD timeout = 3000;
+        HKEY eakey;
+        BOOL ret;
 
         link2ea = TRUE;
         if (!SetUserObjectInformationA(desktop, 1000, &timeout, sizeof(timeout)))
             WINE_ERR("Failed to set desktop timeout, err %u.\n", GetLastError());
+
+        if (!RegOpenKeyExW(HKEY_LOCAL_MACHINE, ea_desktop_pathW, 0, KEY_ALL_ACCESS, &eakey))
+        {
+            size = sizeof(is_unavailable);
+            if (!RegQueryValueExW(eakey, IsUnavailableW, NULL, &type, (BYTE *)&is_unavailable, &size)
+                    && type == REG_DWORD && is_unavailable)
+            {
+                WINE_ERR("EA Desktop\\IsUnavailable is set, clearing.\n");
+                is_unavailable = 0;
+                RegSetValueExW(eakey, IsUnavailableW, 0, REG_DWORD, (BYTE *)&is_unavailable, sizeof(is_unavailable));
+            }
+            RegCloseKey(eakey);
+        }
+        if ((manager = OpenSCManagerA(NULL, SERVICES_ACTIVE_DATABASEA, SERVICE_QUERY_STATUS)))
+        {
+            if ((service = OpenServiceA(manager, "EABackgroundService", SERVICE_QUERY_STATUS)))
+            {
+                if (QueryServiceStatus(service, &status))
+                {
+                    TRACE("dwCurrentState %#x.\n", status.dwCurrentState);
+                    if (status.dwCurrentState == SERVICE_STOP_PENDING || status.dwCurrentState == SERVICE_STOPPED)
+                    {
+                        ret = DeleteFileA("C:\\ProgramData\\EA Desktop\\backgroundservice.ini");
+                        WARN("Tried to delete backgroundservice.ini, ret %d, error %u.\n", ret, GetLastError());
+                    }
+                }
+                else ERR("Could not query service status, error %u.\n", GetLastError());
+                CloseServiceHandle(service);
+            }
+            else TRACE("Could not open EABackgroundService, error %u.\n", GetLastError());
+            CloseServiceHandle(manager);
+        }
+        else ERR("Could not open service manager, error %u.\n", GetLastError());
     }
     hide_window = env_nonzero("PROTON_HIDE_PROCESS_WINDOW");
 
@@ -1196,22 +1368,32 @@ run:
 
     if (use_shell_execute)
     {
+        WCHAR *param = NULL;
+        WCHAR *executable_name_end = get_end_of_excutable_name(cmdline);
+        if (*executable_name_end != '\0')
+        {
+            *executable_name_end = '\0';
+            param = executable_name_end+1;
+        }
         static const WCHAR verb[] = { 'o', 'p', 'e', 'n', 0 };
         INT_PTR ret;
 
-        if ((ret = (INT_PTR)ShellExecuteW(NULL, verb, cmdline, NULL, NULL, hide_window ? SW_HIDE : SW_SHOWNORMAL)) < 32)
+        if ((ret = (INT_PTR)ShellExecuteW(NULL, verb, cmdline, param, NULL, hide_window ? SW_HIDE : SW_SHOWNORMAL)) < 32)
         {
-            WINE_ERR("Failed to execture %s, ret %u.\n", wine_dbgstr_w(cmdline), (unsigned int)ret);
+            WINE_ERR("Failed to execute %s, ret %u.\n", wine_dbgstr_w(cmdline), (unsigned int)ret);
             if (game_process && ret == SE_ERR_NOASSOC && link2ea)
             {
+                static const WCHAR msi_guidW[] = {'{','C','2','6','2','2','0','8','5','-','A','B','D','2','-','4','9','E','5','-','8','A','B','9','-','D','3','D','6','A','6','4','2','C','0','9','1','}',0};
+                static const WCHAR REMOVE_ALL_W[] = {'R','E','M','O','V','E','=','A','L','L',0};
+
                 /* Try to uninstall EA desktop so it is set up from prerequisites on the next run. */
-                UINT ret = MsiConfigureProductExW(L"{C2622085-ABD2-49E5-8AB9-D3D6A642C091}", 0, INSTALLSTATE_DEFAULT, L"REMOVE=ALL");
+                UINT ret = MsiConfigureProductExW(msi_guidW, 0, INSTALLSTATE_DEFAULT, REMOVE_ALL_W);
 
                 WINE_TRACE("MsiConfigureProductExW ret %u.\n", ret);
                 /* If uninstall failed this should trigger interactive repair window on the EA setup run. */
-                RegDeleteTreeW(HKEY_LOCAL_MACHINE, L"Software\\Classes\\link2ea");
-                RegDeleteTreeW(HKEY_LOCAL_MACHINE, L"Software\\Electronic Arts\\EA Desktop");
-                RegDeleteTreeW(HKEY_LOCAL_MACHINE, L"Software\\Electronic Arts\\EA Core");
+                RegDeleteTreeW(HKEY_LOCAL_MACHINE, link2ea_pathW);
+                RegDeleteTreeW(HKEY_LOCAL_MACHINE, ea_desktop_pathW);
+                RegDeleteTreeW(HKEY_LOCAL_MACHINE, ea_core_pathW);
             }
         }
         return INVALID_HANDLE_VALUE;
@@ -1242,8 +1424,10 @@ static BOOL steam_command_handler(int argc, char *argv[])
     typedef NTSTATUS (WINAPI *__WINE_UNIX_SPAWNVP)(char *const argv[], int wait);
     static __WINE_UNIX_SPAWNVP p__wine_unix_spawnvp;
     NTSTATUS status = STATUS_UNSUCCESSFUL;
+    BOOL restart_self = FALSE;
     char **unix_argv;
     HMODULE module;
+    const char *sgi;
     int i, j;
     static char *unix_steam[] =
     {
@@ -1255,6 +1439,33 @@ static BOOL steam_command_handler(int argc, char *argv[])
     /* If there are command line options, only forward steam:// and options start with - */
     if (argc > 1 && StrStrIA(argv[1], "steam://") != argv[1] && argv[1][0] != '-')
         return FALSE;
+
+    if (argc > 2 && !strcmp(argv[1], "--") && (sgi = getenv("SteamGameId")))
+    {
+        char s[64];
+
+        snprintf(s, sizeof(s), "steam://launch/%s", sgi);
+        if (!(restart_self = !strcmp(argv[2], s)))
+        {
+            snprintf(s, sizeof(s), "steam://rungameid/%s", sgi);
+            restart_self = !strcmp(argv[2], s);
+        }
+    }
+    if (restart_self)
+    {
+        HANDLE event;
+
+        event = OpenEventA(SYNCHRONIZE, FALSE, "PROTON_STEAM_EXE_RESTART_APP");
+        if (event)
+        {
+            SetEvent(event);
+            CloseHandle(event);
+            WINE_TRACE("Signalled app restart.\n");
+        }
+        else
+            WINE_ERR("Restart event not found.\n");
+        return TRUE;
+    }
 
     if (!p__wine_unix_spawnvp)
     {
@@ -1301,16 +1512,28 @@ static BOOL steam_command_handler(int argc, char *argv[])
         WINE_ERR("Forwarding");
         for (i = 0; i < argc; ++i)
             WINE_ERR(" %s", wine_dbgstr_a(argv[i]));
-        WINE_ERR(" to native steam failed, status %#lx.\n", status);
+        WINE_ERR(" to native steam failed, status %#x.\n", status);
     }
     return TRUE;
 }
 
 static void setup_steam_files(void)
 {
-    static const WCHAR config_pathW[] = L"C:\\Program Files (x86)\\Steam\\config";
-    static const WCHAR steamapps_pathW[] = L"C:\\Program Files (x86)\\Steam\\steamapps";
-    static const WCHAR libraryfolders_nameW[] = L"C:\\Program Files (x86)\\Steam\\steamapps\\libraryfolders.vdf";
+    static const WCHAR config_pathW[] =
+    {
+        'C',':','\\','P','r','o','g','r','a','m',' ','F','i','l','e','s',' ','(','x','8','6',')','\\','S','t','e','a','m',
+        '\\','c','o','n','f','i','g',0,
+    };
+    static const WCHAR steamapps_pathW[] =
+    {
+        'C',':','\\','P','r','o','g','r','a','m',' ','F','i','l','e','s',' ','(','x','8','6',')','\\','S','t','e','a','m',
+        '\\','s','t','e','a','m','a','p','p','s',0,
+    };
+    static const WCHAR libraryfolders_nameW[] =
+    {
+        'C',':','\\','P','r','o','g','r','a','m',' ','F','i','l','e','s',' ','(','x','8','6',')','\\','S','t','e','a','m',
+        '\\','s','t','e','a','m','a','p','p','s','\\','l','i','b','r','a','r','y','f','o','l','d','e','r','s','.','v','d','f',0,
+    };
     const char *steam_install_path = getenv("STEAM_COMPAT_CLIENT_INSTALL_PATH");
     const char *steam_library_paths = getenv("STEAM_COMPAT_LIBRARY_PATHS");
     const char *start, *end, *next;
@@ -1417,8 +1640,8 @@ static void setup_steam_files(void)
 
 static HANDLE find_ack_event(void)
 {
-    static const WCHAR steam_ack_event[] = L"STEAM_START_ACK_EVENT";
-    static const WCHAR name[] = L"\\BaseNamedObjects\\Session\\1";
+    static const WCHAR steam_ack_event[] = {'S','T','E','A','M','_','S','T','A','R','T','_','A','C','K','_','E','V','E','N','T',0};
+    static const WCHAR name[] = {'\\','B','a','s','e','N','a','m','e','d','O','b','j','e','c','t','s','\\','S','e','s','s','i','o','n','\\','1',0};
     DIRECTORY_BASIC_INFORMATION *di;
     OBJECT_ATTRIBUTES attr;
     HANDLE dir, ret = NULL;
@@ -1499,6 +1722,29 @@ static DWORD WINAPI steam_drm_thread(void *arg)
 
     return 0;
 }
+
+BOOL is_ptraced(void)
+{
+    char key[50];
+    int value;
+    FILE *fp = fopen("/proc/self/status", "r");
+    BOOL ret = FALSE;
+
+    if (!fp) return FALSE;
+
+    while (fscanf(fp, " %s	%d\n", key, &value) > 0)
+    {
+        if (!strcmp("TracerPid:", key))
+        {
+            ret = (value != 0);
+            break;
+        }
+    }
+
+    fclose(fp);
+    return ret;
+}
+
 int main(int argc, char *argv[])
 {
     HANDLE wait_handle = INVALID_HANDLE_VALUE;
@@ -1521,7 +1767,7 @@ int main(int argc, char *argv[])
         /* For 2K Launcher. */
         event2 = CreateEventA(NULL, FALSE, FALSE, "Global\\Valve_SteamIPC_Class");
 
-        CreateThread(NULL, 0, create_steam_window, NULL, 0, NULL);
+        CreateThread(NULL, 0, create_steam_windows, NULL, 0, NULL);
 
         set_active_process_pid();
 
@@ -1530,6 +1776,8 @@ int main(int argc, char *argv[])
             setup_steam_registry();
             setup_battleye_bridge();
             setup_eac_bridge();
+            setup_proton_voice_files();
+            setup_proton_soundfonts();
         }
         else
         {
@@ -1542,7 +1790,7 @@ int main(int argc, char *argv[])
         {
             unsigned int sleep_count = 0;
             WINE_TRACE("PROTON_WAIT_ATTACH is set, waiting for debugger...\n");
-            while (!IsDebuggerPresent())
+            while (!IsDebuggerPresent() && !is_ptraced())
             {
                 Sleep(100);
                 ++sleep_count;
@@ -1588,8 +1836,46 @@ int main(int argc, char *argv[])
 
     if(wait_handle != INVALID_HANDLE_VALUE)
     {
+        HANDLE waits[2];
+        DWORD ret;
+        int wait_count;
+
+        waits[0] = wait_handle;
+        waits[1] = NULL;
+        wait_count = 1;
+        if (game_process)
+        {
+            if ((waits[1] = CreateEventA(NULL, FALSE, FALSE, "PROTON_STEAM_EXE_RESTART_APP")))
+            {
+                ++wait_count;
+            }
+            else
+            {
+                WINE_ERR("Failed to create restart event, err %lu.\n", GetLastError());
+            }
+        }
         FreeConsole();
-        WaitForSingleObject(wait_handle, INFINITE);
+        while ((ret = WaitForMultipleObjects(wait_count, waits, FALSE, INFINITE) != WAIT_OBJECT_0))
+        {
+            BOOL should_await;
+
+            if (ret != WAIT_OBJECT_0 + 1)
+            {
+                WINE_ERR("Wait failed.\n");
+                break;
+            }
+            if (child != INVALID_HANDLE_VALUE)
+            {
+                if (WaitForSingleObject(child, 0) == WAIT_TIMEOUT)
+                {
+                    WINE_ERR("Child is still running, not restarting.\n");
+                    continue;
+                }
+                CloseHandle(child);
+            }
+            child = run_process(&should_await, game_process);
+        }
+        CloseHandle(waits[1]);
     }
 
     if (event != INVALID_HANDLE_VALUE)
